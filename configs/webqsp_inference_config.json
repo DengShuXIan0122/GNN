@@ -1,0 +1,49 @@
+{
+  "dataset": "webqsp",
+  "checkpoint_path": "gnn/outputs/gnn_rag3_webqsp/joint2_best.pt",
+  "gpu_id": 0,
+  "base_dir": ".",
+  "rag3_params": {
+    "use_appr": true,
+    "appr_alpha": 0.85,
+    "cand_n": 1200,
+    "use_dde": true,
+    "hop_dim": 16,
+    "dir_dim": 8,
+    "use_pcst": true,
+    "pcst_lambda": [0.1, 0.1, 0.05],
+    "mid_restart": true
+  },
+  "stages": {
+    "hybrid": {
+      "batch_size": 16,
+      "eval_split": "test",
+      "save_subgraphs": true,
+      "compute_coverage": true
+    },
+    "gnn": {
+      "batch_size": 8,
+      "eval_split": "test",
+      "save_attention": true,
+      "compute_distances": true,
+      "apply_dde": true
+    },
+    "pcst": {
+      "batch_size": 8,
+      "eval_split": "test",
+      "compute_connectivity": true,
+      "compute_kg_tokens": true,
+      "save_evidence": true
+    },
+    "llm": {
+      "llm_params": {
+        "model_name": "llama2-7b",
+        "max_length": 2048,
+        "temperature": 0.1,
+        "top_p": 0.9,
+        "do_sample": true,
+        "num_beams": 1
+      }
+    }
+  }
+}

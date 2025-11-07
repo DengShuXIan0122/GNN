@@ -1,0 +1,80 @@
+{
+  "dataset": "webqsp",
+  "gpu_id": 0,
+  "base_dir": ".",
+  "use_multi_gpu": true,
+  "gpu_ids": [0, 1],
+  "language_model": {
+    "lm": "sbert",
+    "lm_frozen": 1,
+    "lm_dropout": 0.3
+  },
+  "model_params": {
+    "entity_dim": 50,
+    "num_iter": 2,
+    "num_ins": 3,
+    "num_gnn": 3
+  },
+  "rag3_params": {
+    "use_appr": true,
+    "appr_alpha": 0.85,
+    "cand_n": 1200,
+    "use_dde": true,
+    "hop_dim": 16,
+    "dir_dim": 8,
+    "use_pcst": true,
+    "pcst_lambda": [0.1, 0.1, 0.05],
+    "mid_restart": true
+  },
+  "performance_optimizations": {
+    "use_fast_heuristic": true,
+    "vectorized_operations": true,
+    "distance_caching": true
+  },
+  "stages": {
+    "warmup": {
+      "num_epoch": 8,
+      "learning_rate": 1e-3,
+      "freeze_gnn": true,
+      "train_hybrid_only": true,
+      "batch_size": 16,
+      "eval_every": 2,
+      "save_every": 2
+    },
+    "joint1": {
+      "num_epoch": 8,
+      "learning_rate": 5e-4,
+      "num_gnn_layers": 6,
+      "hidden_dim": 256,
+      "dropout": 0.1,
+      "num_heads": 3,
+      "batch_size": 16,
+      "eval_every": 2,
+      "save_every": 2,
+      "load_checkpoint": "warmup_best.pt"
+    },
+    "pcst_distill": {
+      "num_epoch": 8,
+      "learning_rate": 1e-4,
+      "pcst_distill_only": true,
+      "gumbel_temp": 2.0,
+      "batch_size": 16,
+      "eval_every": 2,
+      "save_every": 2,
+      "load_checkpoint": "joint1_best.pt"
+    },
+    "joint2": {
+      "num_epoch": 8,
+      "learning_rate": 2e-4,
+      "gumbel_temp_start": 2.0,
+      "gumbel_temp_end": 0.5,
+      "temp_anneal_steps": 150,
+      "lambda_ret": 0.1,
+      "lambda_pcst": 0.2,
+      "batch_size": 16,
+      "eval_every": 2,
+      "save_every": 2,
+      "load_checkpoint": "pcst_distill_best.pt"
+    }
+  }
+}

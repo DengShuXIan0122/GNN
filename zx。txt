@@ -1,0 +1,631 @@
+将的“结构先验型多层图推理框架”与 GNN-RAG 的“语义驱动可学习扩散”结合，构成一个 **“结构归纳增强的检索增强生成框架（GNN-RAG³）”**。 
+
+**核心思想：**
+
+* 用 APPR 提供结构初始化分布（先验）
+* 用 GNN-RAG 学习图上传播机制（学习）
+* 用 DDE 注入几何距离与方向偏置（归纳）
+* 用 PCST 强化输出连通性与解释性（约束）
+
+---
+
+# 一、系统总体架构（五层结构）
+
+| 层级  | 模块                                  | 功能                    | 对应你/他          |
+| --- | ----------------------------------- | --------------------- | -------------- |
+| 1️⃣ | Text Encoder + Entity Linking       | 从问题中提取语义向量与实体集合       | 两者共有           |
+| 2️⃣ | Hybrid Retrieval (Embedding + APPR) | 将语义相似与结构相似融合，筛选候选子图   | 你的模块（显式结构先验）   |
+| 3️⃣ | DDE-Enhanced GNN Propagation        | 基于可学习扩散的消息传递，带方向/距离偏置 | 结合（他 + 你的 DDE） |
+| 4️⃣ | PCST-regularized Evidence Graph     | 对预测得分加结构化连通约束，生成紧凑证据链 | 你的模块（优化输出）     |
+| 5️⃣ | LLM Generation                      | 对证据路径进行文本化生成答案        | 他（下游推理）        |
+
+---
+
+# 二、核心机制逐层详解
+
+## 🧩 第1层：语义理解与实体链接
+
+* 文本编码器：T5 / BERT / RoBERTa
+* 取 [CLS] / pooled 向量为 (z_q)
+* 实体识别与消歧：
+
+  * NER + 候选生成（BM25 / 候选表）
+  * 按置信度取前 k 个主题实体 (T_q)
+* 输出：(z_q, T_q)
+
+这部分保持一致；GNN-RAG 也是这么做的。
+
+---
+
+## 🕸 第2层：Hybrid Retrieval（APPR + 语义嵌入）
+
+### ✦ 原 GNN-RAG 做法：
+
+通过 dense retriever 计算文本相似度，再以实体为种子在图上展开，形成密子图。
+不足：语义漂移、候选不稳、计算昂贵。
+
+### ✦ 改进方案：
+
+引入 **Personalized PageRank (PPR)** 或 **APPR（Approximate Push-based PPR）**：
+
+1. **算法：**
+   [
+   p = \alpha (I-(1-\alpha)A)^{-1}p_0
+   ]
+
+   * (p_0)：种子分布（T_q）
+   * (\alpha)：重启系数（0.85）
+   * (A)：邻接矩阵（关系归一化）
+
+2. **近似实现（APPR）**：
+
+   * Push-based 算法，复杂度 O(|E|ε⁻¹)
+   * 适用于大规模图，结果稀疏
+
+3. **融合可学习权重：**
+   [
+   s_v = \sigma(W_1 [,sim_{embed}(z_q, e_v);,PPR_v,] + b)
+   ]
+
+   * 其中 (W_1) 学习语义与结构的相对权重
+   * 输出打分 (s_v)，取前 N（如 1000）节点构成候选子图 (G_c)
+
+4. **作用：**
+
+   * 给 GNN-RAG 的传播阶段提供结构良好的初始化分布；
+   * 避免早期传播进入语义不相关区域。
+
+---
+
+## 🔄 第3层：DDE-Enhanced GNN Propagation
+
+### ✦ 原 GNN-RAG 的传播：
+
+每层维护节点重要性 (p^{(l)})，并根据邻接边和关系权重传播：
+[
+p^{(l+1)}=(1-\alpha)A_\theta^T p^{(l)}+\alpha p^{(0)}
+]
+
+* (A_\theta)：由关系注意力生成；
+* 每层 message 依赖问题语义 (q)；
+* 每层传播后进行 **重启机制（restart）**，确保局部信息保留。
+
+### ✦ 你的增强：
+
+加入 **方向-距离编码 (Directional Distance Encoding, DDE)**：
+
+1. 计算每节点到问题实体的距离 Dist(v)
+
+   * BFS 或 Dijkstra（只在 G_c 上运行）；
+
+2. 定义边特征：
+   [
+   \psi(u,v) = E_h(\min(Dist(u), Dist(v))) + E_d(dir(u,v))
+   ]
+   其中：
+
+   * (E_h)：可学习距离嵌入（8–64维）
+   * (E_d)：方向嵌入（in/out/self）
+
+3. 在 GNN 消息传递时加入：
+   [
+   m_{u\to v} = f(h_u, h_v, r_{uv}, \psi(u,v))
+   ]
+
+   * (f)：GAT/GCN/MPNN 类型
+   * 使传播受几何约束，方向感与距离感显式化
+
+4. **效果：**
+
+   * 避免语义相近但拓扑远的错误扩散；
+   * 强化多跳路径推理；
+   * 在 WebQSP / MetaQA 3-hop 上提升显著。
+
+---
+
+## 🌲 第4层：PCST（Prize-Collecting Steiner Tree）结构优化
+
+### ✦ 原 GNN-RAG 输出：
+
+选 Top-K 重要节点 / 三元组，抽“问题实体 → 答案实体”的最短路径作为证据。
+
+### ✦ 改进方案：
+
+用 PCST 强化连通性和紧凑性：
+
+1. **问题形式化：**
+   [
+   \max_{T\subseteq G_c} \sum_{v\in T} prize(v) - \sum_{e\in T} cost(e)
+   ]
+
+   * prize(v)：节点重要性（如 (p_\theta(v))）
+   * cost(e)：边距离 / 关系代价
+
+2. **可微实现（训练时）**
+
+   * 用 Gumbel-sigmoid mask (\pi_e) 近似选择边；
+   * 加结构正则：
+     [
+     L_{pcst} = \lambda_1(\text{cost}\cdot\pi) + \lambda_2,\text{ConnPenalty}(\pi) + \lambda_3,\text{SparsityPenalty}(\pi)
+     ]
+   * ConnPenalty 可用图拉普拉斯正则近似。
+
+3. **推理时**
+
+   * 用贪心/近似算法生成最优连通子图；
+   * 文本化后输入 LLM。
+
+4. **效果**
+
+   * 子图更连通、噪声少；
+   * 提升事实一致性与可解释性；
+   * 可作为 LLM 输入窗口压缩机制。
+
+---
+
+## 🧩 第5层：LLM 生成层（与他保持一致）
+
+* 输入：问题文本 + 子图三元组（路径文本化）；
+* 模型：LLaMA / T5 / Flan；
+* 输出：自然语言答案；
+* 可选：用 Self-consistency / Chain-of-Thought 提升稳健性。
+
+---
+
+# 三、训练细节
+
+### 损失函数
+
+[
+L = L_{QA} + \lambda_1 L_{retrieval} + \lambda_2 L_{pcst} + \lambda_3 L_{contrastive}
+]
+
+* (L_{QA})：答案监督（CE 或节点分类 + LLM 输出一致性）；
+* (L_{retrieval})：APPR 召回层的 pairwise 排序损失；
+* (L_{pcst})：结构正则；
+* (L_{contrastive})：语义对比学习（q 与正确实体 embedding）。
+
+### 优化策略
+
+* 预热阶段：冻结 GNN，先训练 Hybrid 层；
+* 第二阶段：启用 GNN + DDE；
+* 第三阶段：引入 PCST 软正则；
+* 最终阶段：轻调 LLM LoRA 头。
+
+---
+
+# 四、理论增强机制总结
+
+| 模块          | 对性能的主要贡献              |
+| ----------- | --------------------- |
+| **APPR 层**  | 显式结构先验，使检索稳定、高召回      |
+| **DDE 编码**  | 提供方向与距离归纳偏置，提高多跳推理能力  |
+| **PCST 约束** | 提升证据链连通性、减少冗余、增强解释性   |
+| **融合训练**    | 保持梯度可通，端到端优化结构-语义联合表示 |
+
+理论提升来源：
+
+1. **更稳的初始分布** → 减少错误扩散；
+2. **几何感知传播** → 强化远程依赖捕捉；
+3. **结构正则** → 提高结果一致性与可解释性。
+
+---
+
+# 五、预期性能（参考 WebQSP）
+
+| 模型                           | Acc        | 解释性 |
+| ---------------------------- | ---------- | --- |
+| SubgraphRAG                  | 73         | 弱   |
+| GNN-RAG                      | 90         | 一般  |
+| GNN-RAG³ (APPR + DDE + PCST) | **94–95+** | 强   |
+
+---
+
+# 🧩 六、核心逻辑一句话总结
+
+> GNN-RAG 学的是 “如何在图上传播语义”；
+> 你提供的是 “图该从哪里开始传播、传播该受哪些几何约束、结果该连成什么样”。
+
+两者合体后，信息流变成：
+[
+\text{语义问题} \Rightarrow \text{结构先验 (APPR)} \Rightarrow \text{几何传播 (DDE+GNN)} \Rightarrow \text{结构优化 (PCST)} \Rightarrow \text{生成 (LLM)}
+和伪代码好，给你一套**可直接照着实现**的伪代码（训练 + 推理 + 路由），把你的 APPR/DDE/PCST 和论文里的 GNN-RAG 主干无缝拼好。变量名尽量工程化、可落地。文末给关键机制出处。
+
+---
+
+## 0) 配置与数据结构
+
+```pseudo
+# === Hyper params ===
+L = 6                         # GNN 层数（中途重启用偶数）  [论文]
+K = 3                         # 问题多头语义
+EMB_DIM = 256                 # 节点/关系隐层
+HOP_EMB_DIM = 16              # DDE 距离嵌入维度
+DIR_EMB_DIM = 8               # DDE 方向嵌入维度
+ALPHA_PPR = 0.85              # APPR 重启系数（结构先验）
+TOPN_CAND = 1200              # 候选子图节点数上限
+CUM_PROB_TH = 0.95            # 累计概率阈值（筛候选答案）  [论文]
+PCST_LAMBDA = (0.1, 0.1, 0.05)# (cost, connectivity, sparsity) 权重
+EDGE_TEMP = 2.0               # Gumbel-Sigmoid 初始温度
+
+# === Inputs ===
+q: string                   # 问题
+KG: (V, E, R)               # 知识图谱
+Docs: optional              # 若需长上下文检索
+
+# === Outputs ===
+ans: list[str]              # 答案
+evidence_paths: list[path]  # 证据路径（文本化）
+```
+
+---
+
+## 1) 前置模块
+
+```pseudo
+function TEXT_ENCODER(q) -> z_q:
+    # Transformer 编码器 (BERT/T5/RoBERTa)
+    return pooled_cls(q)
+
+function ENTITY_LINK(q) -> T_q:
+    # NER + 候选检索 + 消歧（你已有实现）
+    return [entities...]
+
+function APPR(KG, seeds=T_q, alpha=ALPHA_PPR, tol=1e-6) -> appr_score:
+    # Push-based Approximate PPR，返回每个节点的结构相关度
+    return dict(node_id -> score)
+
+function SEM_SIM(z_q, V) -> sem_score:
+    # z_q 与节点/别名嵌入的语义相似度（dense retriever）
+    return dict(node_id -> score)
+
+function HYBRID_RETRIEVAL(sem_score, appr_score, z_q) -> cand_nodes:
+    alpha_q = sigmoid(W_alpha @ z_q)     # 可学习权重（标量或小向量）
+    s_v = alpha_q * appr_score[v] + (1 - alpha_q) * sem_score[v] + b
+    cand_nodes = topN_by_score(s_v, N=TOPN_CAND)
+    return cand_nodes
+```
+
+---
+
+## 2) 候选子图与距离编码（DDE）
+
+```pseudo
+function BUILD_CAND_SUBGRAPH(KG, cand_nodes) -> G_c:
+    # 取子图：cand_nodes 诱导的节点 + 其间的边（包含关系类型）
+    return subgraph
+
+function DIST_TO_SEEDS(G_c, T_q) -> Dist:
+    # 仅在 G_c 上跑距离，省计算
+    # 若边等权：BFS；非负权：Dijkstra。超大稀疏：BMSSP
+    return dict(node -> hop_dist)
+
+function DDE_EDGE_FEAT(G_c, Dist) -> edge_feat:
+    for e = (u -> v) in G_c.E:
+        h = min(Dist[u], Dist[v])
+        dir = direction(u, v)  # in/out/self
+        dde = EmbHop(h) ⊕ EmbDir(dir)   # learnable
+        edge_feat[e] = dde
+    return edge_feat
+```
+
+---
+
+## 3) GNN-RAG 主干（带中途重启）+ 你的 DDE 融合
+
+```pseudo
+function Q_HEADS(z_q, K) -> [q_k]:
+    # 将问题语义分解为 K 个头（attention pooling）
+    return [q_1, ..., q_K]
+
+function REL_EMB(relation) -> r_emb:
+    # 关系文本 -> LM 编码 -> 取 CLS/投影
+    return r_emb
+
+function MESSAGE(u, v, r, q_k, dde) -> m_u2v:
+    # 论文里基于 (q_k ⊙ r) 的相关性门控  ×  你的 DDE 几何门控
+    gate_rel = sigma(q_k ⊙ r)
+    gate_geo = MLP_dde(dde)              # 或 sigmoid/softplus
+    return gate_rel ⊙ gate_geo ⊙ W_msg @ h_u
+
+function GNN_PROPAGATE(G_c, T_q, z_q, L, K, edge_feat) -> (H, pL):
+    init:
+        H^(0)[v] = node_init(v)          # 可含别名/类型嵌入
+        p^(0)[v] = 1 if v ∈ T_q else 0   # 种子概率
+        q_heads = Q_HEADS(z_q, K)
+
+    for l in 0..L-1:
+        # 消息汇聚（多头）
+        for v in G_c.V:
+            agg = []
+            for k in 1..K:
+                sum_k = 0
+                for (u -> v, r) in N_in(v):
+                    r_emb = REL_EMB(r)
+                    dde = edge_feat[(u->v)]
+                    m = MESSAGE(u, v, r_emb, q_heads[k], dde)
+                    sum_k += p^(l)[u] * m
+                agg.append(sum_k)
+            H_tmp[v] = MLP_cat([H^(l)[v]] ⊕ concat(agg))   # ψ(·)
+
+        # 节点重要度更新 + 归一化
+        for v: s[v] = H_tmp[v] · w_learnable
+        p^(l+1) = softmax(s)      # 概率分布，注意数值稳定
+
+        # 中途重启（关键！）
+        if l == L/2 - 1:
+            p^(l+1) = p^(0)      # 重启回种子，避免扩散漂移   [论文]
+
+        H^(l+1) = H_tmp
+
+    return H^(L), p^(L)
+```
+
+---
+
+## 4) 筛候选答案、抽最短路并文本化（送 LLM）
+
+```pseudo
+function SELECT_ANS_CAND(pL, threshold=CUM_PROB_TH) -> A_cand:
+    # 按 pL 从高到低累加，直到累计概率 ≥ 0.95    [论文]
+    return top_set
+
+function SHORTEST_PATHS(G_c, T_q, A_cand) -> paths:
+    # 对每个候选答案 a ∈ A_cand ，找 T_q 到 a 的最短路径
+    # 可多条，限制条数与长度
+    return list_of_paths
+
+function VERBALIZE(paths) -> knowledge_text:
+    # 将三元组/路径模板化，拼出 “Knowledge: ... \n Question: ...”
+    return str
+```
+
+---
+
+## 5) PCST 结构化证据（蒸馏 + 软约束）
+
+```pseudo
+# --- 阶段A：PCST 后处理蒸馏（先易后难） ---
+function PCST_APPROX(G_c, node_prize, edge_cost) -> G_hat:
+    # Goemans/Williamson 近似或贪心
+    return subgraph_mask (nodes/edges)
+
+function EDGE_SELECTOR(scores) -> pi_soft:
+    # 学一个边选择头：pi_e = sigmoid(W_edge @ score_e)
+    return dict(edge -> prob)
+
+# 训练时：
+G_hat = PCST_APPROX(G_c,
+        prize = α * APPR_score + (1-α) * node_score_from_pL,
+        cost  = β * dist(edge) + γ * relation_cost(edge.rel))
+pi_soft = EDGE_SELECTOR(edge_scores_from_GNN)
+L_pcst_distill = BCE(pi_soft, mask(G_hat))
+
+# --- 阶段B：可微软约束（联训） ---
+function PCST_SOFT_REG(pi_soft, cost, Laplacian) -> L_pcst:
+    conn = pi_soft^T * Laplacian * pi_soft          # 连通性近似
+    sparse = L1(pi_soft)                             # 稀疏惩罚
+    return λ1 * (cost · pi_soft).sum() + λ2 * conn + λ3 * sparse
+```
+
+---
+
+## 6) LLM 端生成
+
+```pseudo
+function LLM_GENERATE(knowledge_text, q) -> answers:
+    # LLaMA/Flan，或轻量 LoRA
+    return decode_answers()
+
+# 若做联合调优：最小化 L_QA（答案交叉熵 / span F1）
+```
+
+---
+
+## 7) 训练主循环（四阶段日程，稳定收敛）
+
+```pseudo
+for step in 1..MAX_STEPS:
+
+    # === (1) 前向 ===
+    z_q = TEXT_ENCODER(q)
+    T_q = ENTITY_LINK(q)
+
+    sem = SEM_SIM(z_q, KG.V)
+    appr = APPR(KG, T_q, alpha=ALPHA_PPR)
+    cand_nodes = HYBRID_RETRIEVAL(sem, appr, z_q)
+    G_c = BUILD_CAND_SUBGRAPH(KG, cand_nodes)
+
+    Dist = DIST_TO_SEEDS(G_c, T_q)
+    edge_feat = DDE_EDGE_FEAT(G_c, Dist)
+
+    H, pL = GNN_PROPAGATE(G_c, T_q, z_q, L, K, edge_feat)
+    A_cand = SELECT_ANS_CAND(pL, CUM_PROB_TH)    # 0.95 [论文]
+    paths = SHORTEST_PATHS(G_c, T_q, A_cand)
+    knowledge = VERBALIZE(paths)
+
+    pred_answers = LLM_GENERATE(knowledge, q)
+
+    # === (2) 损失 ===
+    L_QA = QA_LOSS(pred_answers, gold_answers)
+    L_ret = RETRIEVAL_RANKING_LOSS(cand_nodes, gold_neighbors)    # pairwise
+    L_con = CONTRASTIVE(z_q, pos_entities, neg_entities)
+    # PCST 蒸馏/软约束按日程分阶段开启
+    if STAGE >= A:
+        L_pcst_distill = BCE(EDGE_SELECTOR(...), mask_from_PCST(...))
+    if STAGE >= B:
+        L_pcst = PCST_SOFT_REG(pi_soft, cost=edge_cost, Laplacian=L_g)
+
+    total_loss = L_QA + λ_r*L_ret + λ_c*L_con + λ_p*(L_pcst + L_pcst_distill)
+
+    # === (3) 反传与优化 ===
+    total_loss.backward()
+    optimizer.step(); optimizer.zero_grad()
+
+    # === (4) 温度与权重调度 ===
+    EDGE_TEMP = schedule(EDGE_TEMP)   # 2.0 → 0.5（退火）
+```
+
+**训练日程建议**
+
+* Warm-up 5k：冻 GNN，只训 HYBRID (W_alpha) + EL 重排
+* Joint-1 20k：开 GNN + DDE（不开 PCST），λ_r=0.1
+* Distill 10k：加 L_pcst_distill，λ_p=0.1
+* Joint-2 20k：加软约束 L_pcst，λ_p=0.2；控制梯度与温度
+* LLM 端：仅 LoRA（r=16, α=32），lr 小（5e-5）
+
+---
+
+## 8) 推理（无梯度）
+
+```pseudo
+function INFER(q):
+    z_q = TEXT_ENCODER(q)
+    T_q = ENTITY_LINK(q)
+
+    sem = SEM_SIM(z_q, KG.V); appr = APPR(KG, T_q)
+    cand_nodes = HYBRID_RETRIEVAL(sem, appr, z_q)
+    G_c = BUILD_CAND_SUBGRAPH(KG, cand_nodes)
+
+    Dist = DIST_TO_SEEDS(G_c, T_q)
+    edge_feat = DDE_EDGE_FEAT(G_c, Dist)
+
+    H, pL = GNN_PROPAGATE(G_c, T_q, z_q, L, K, edge_feat)
+    A_cand = SELECT_ANS_CAND(pL, 0.95)                      # [论文]
+    paths = SHORTEST_PATHS(G_c, T_q, A_cand)
+    knowledge = VERBALIZE(paths)
+
+    answers = LLM_GENERATE(knowledge, q)
+    return answers, paths
+```
+
+---
+
+## 9) 与长上下文检索的路由（GNN-RAG+Route）
+
+```pseudo
+function ROUTE(q):
+    ans_gnn, paths_gnn = INFER(q)            # 深图上下文路径
+    # 文本嵌入检索（SubgraphRAG），取 top-k=100 三元组  [论文]
+    triples_long = TEXT_EMBED_RETRIEVE(q, k=100)
+
+    if any(answer ∉ entities(triples_long) for answer in ans_gnn):
+        # 说明 GNN-RAG 给出了“长上下文未覆盖”的深层图证据 → 走 GNN 路径
+        return ans_gnn, paths_gnn
+    else:
+        # 语义检索已覆盖答案 → 走长上下文（更大全局证据）
+        ans_lc = LONG_CONTEXT_LLM(q, triples_long)
+        return ans_lc, triples_long
+```
+
+---
+
+## 关键机制与参数出处（论文页码/行号）
+
+* 深层 GNN 传播、节点重要度 softmax、**L/2 重启**机制与默认 **L=6**：
+
+* 训练时节点分类（答案=1），**累计概率≥0.95** 选候选答案，抽 **最短路径** 文本化作为 LLM 上下文：
+
+* GNN-RAG 先“GNN 取候选答案→最短路→文本化→LLM”，强调“深图上下文”：
+
+* GNN-RAG+Route：与 **SubgraphRAG** 的 **top-k=100** 长上下文对比、**不重叠即路由到 GNN**：
+
+
+
+
+
+          
+不是的，`train_gnn_rag.py` 脚本结束后**不会直接生成包含候选实体排序、推理路径和证据子图的.info文件**。
+
+让我详细解释一下完整的流程：
+
+## 1. `train_gnn_rag.py` 的输出
+
+这个脚本只负责**训练GNN模型**，训练完成后会生成：
+- 训练好的模型检查点文件（如 `joint2_best.pt`）
+- 训练日志文件
+- 基本的评估指标（保存在 `final_results.json`）
+
+但**不会生成.info文件**。
+
+## 2. 生成.info文件需要额外的评估步骤
+
+要生成包含详细推理信息的.info文件，需要在训练完成后**单独运行评估**：
+        
+            
+toolName: view_files
+            
+status: success
+          
+            
+filePath: d:\GNN-RAG-main\gnn\README.md
+          
+## 3. 正确的生成.info文件流程
+
+### 步骤1：训练GNN模型
+```bash
+python train_gnn_rag.py --dataset webqsp --gpu 0
+```
+这会生成训练好的模型检查点。
+
+### 步骤2：运行评估生成.info文件
+训练完成后，需要单独运行评估命令：
+
+```bash
+cd gnn
+python main.py ReaRev --is_eval \
+    --load_experiment joint2_best.pt \
+    --entity_dim 50 \
+    --num_epoch 200 \
+    --batch_size 8 \
+    --eval_every 2 \
+    --data_folder data/webqsp/ \
+    --lm sbert \
+    --num_iter 3 \
+    --num_ins 2 \
+    --num_gnn 3 \
+    --relation_word_emb True \
+    --name webqsp \
+    --use_appr --appr_alpha 0.85 --cand_n 1200 \
+    --use_dde --hop_dim 16 --dir_dim 8 \
+    --use_pcst --pcst_lambda 0.1,0.1,0.05 \
+    --mid_restart
+```
+
+### 步骤3：移动.info文件供LLM使用
+评估完成后，会在GNN的输出目录生成 `{experiment_name}_test.info` 文件，然后需要：
+
+```bash
+# 将.info文件移动到LLM模块
+cp gnn/outputs/gnn_rag3_webqsp/{experiment_name}_test.info llm/results/gnn/test.info
+```
+
+## 4. 完整的GNN-RAG³推理流程
+
+最后，使用LLM进行推理：
+        
+            
+toolName: view_files
+            
+status: success
+          
+            
+filePath: d:\GNN-RAG-main\llm\scripts\rag-reasoning.sh
+          
+从脚本可以看到，LLM推理时会读取 `results/gnn/${DATA_NAME}/rearev-sbert/test.info` 文件作为输入。
+
+## 总结
+
+**`train_gnn_rag.py` 脚本结束后不会直接生成.info文件**。完整流程是：
+
+1. **训练阶段**：`train_gnn_rag.py` → 生成训练好的GNN模型
+2. **评估阶段**：运行 `python main.py --is_eval` → 生成包含推理路径的.info文件  
+3. **推理阶段**：运行 `llm/scripts/rag-reasoning.sh` → LLM使用.info文件进行最终推理
+
+.info文件是在第2步的评估阶段生成的，包含了：
+- 候选实体排序（`cand`字段）
+- 推理路径（每步的`rel_action`）
+- 评估指标（precision, recall, f1等）
+
+这个文件是连接GNN推理和LLM生成的关键桥梁。
+        
